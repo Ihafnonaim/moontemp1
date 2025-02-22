@@ -476,18 +476,20 @@ def train_net_fedprox(net_id, net, global_net, train_dataloader, test_dataloader
 def train_net_fedcon(net_id, net, global_net, previous_nets, train_dataloader, test_dataloader, epochs, lr, args_optimizer, mu, temperature, args,
                       round, device="cpu"):
     net = nn.DataParallel(net)
-    net.cuda()
+    net.to(device)  # Ensure model is on GPU if available
+
+    global_net.to(device)  # Ensure global model is on GPU
+    previous_nets = [prev_net.to(device) for prev_net in previous_nets]  # Move all previous models to GPU once
+
     logger.info('Training network %s' % str(net_id))
     logger.info('n_training: %d' % len(train_dataloader))
     logger.info('n_test: %d' % len(test_dataloader))
 
-    # Pre-training accuracy check
     train_acc, _ = compute_accuracy(net, train_dataloader, device=device)
     test_acc, conf_matrix, _ = compute_accuracy(net, test_dataloader, get_confusion_matrix=True, device=device)
     logger.info('>> Pre-Training Training accuracy: {}'.format(train_acc))
     logger.info('>> Pre-Training Test accuracy: {}'.format(test_acc))
 
-    # Select optimizer
     if args_optimizer == 'adam':
         optimizer = optim.Adam(filter(lambda p: p.requires_grad, net.parameters()), lr=lr, weight_decay=args.reg)
     elif args_optimizer == 'amsgrad':
@@ -495,17 +497,11 @@ def train_net_fedcon(net_id, net, global_net, previous_nets, train_dataloader, t
     elif args_optimizer == 'sgd':
         optimizer = optim.SGD(filter(lambda p: p.requires_grad, net.parameters()), lr=lr, momentum=0.9, weight_decay=args.reg)
 
-    criterion = nn.CrossEntropyLoss().cuda()
+    criterion = nn.CrossEntropyLoss().to(device)  # Ensure loss function is on GPU
 
-    # Ensure previous networks are on GPU
-    for previous_net in previous_nets:
-        previous_net.cuda()
     global_w = global_net.state_dict()
-
-    cnt = 0
     cos = nn.CosineSimilarity(dim=-1)
 
-    # Main training loop
     for epoch in range(epochs):
         epoch_loss_collector = []
         epoch_loss1_collector = []
@@ -513,79 +509,63 @@ def train_net_fedcon(net_id, net, global_net, previous_nets, train_dataloader, t
         epoch_contr_loss_collector = []
 
         for batch_idx, (x, target) in enumerate(train_dataloader):
-            x, target = x.cuda(), target.cuda()
+            x, target = x.to(device), target.to(device)
 
             optimizer.zero_grad()
             x.requires_grad = False
             target.requires_grad = False
             target = target.long()
 
-            # Get current projections from local and global models
             h, pro1, out = net(x)
             _, pro2, _ = global_net(x)
 
-            # Cosine similarity for contrastive loss (FedCon)
-            posi = cos(pro1, pro2)  # Positive similarity with global model
+            posi = cos(pro1, pro2)
             logits = posi.reshape(-1, 1)
 
             pro3 = None
-
-            # Accumulate negative pairs from previous models
             for previous_net in previous_nets:
-                previous_net.cuda()
                 _, pro3, _ = previous_net(x)
                 nega = cos(pro1, pro3)
                 logits = torch.cat((logits, nega.reshape(-1, 1)), dim=1)
-                previous_net.to('cpu')  # Move back to CPU after use
 
             if pro3 is None:
-              pro3 = torch.zeros_like(pro1)
+                pro3 = torch.zeros_like(pro1)
 
             logits /= temperature
-            labels = torch.zeros(x.size(0)).cuda().long()
+            labels = torch.zeros(x.size(0)).to(device).long()
 
-            # FedCon loss (cosine-based)
             loss2 = mu * criterion(logits, labels)
-
-            # Cross-entropy loss (classification)
             loss1 = criterion(out, target)
-   
-            cl = contrastive_loss(pro3,pro1,pro2,0.5)
-                    # print(cl)
-            contrastive_loss_value = mu * cl
-            
-            # Final loss combines all three components
+            contrastive_loss_value = mu * contrastive_loss(pro3, pro1, pro2, 0.5)
             loss = loss1 + loss2 + contrastive_loss_value
 
-            # Backpropagation and optimizer update
             loss.backward()
             optimizer.step()
 
-            cnt += 1
             epoch_loss_collector.append(loss.item())
             epoch_loss1_collector.append(loss1.item())
             epoch_loss2_collector.append(loss2.item())
             epoch_contr_loss_collector.append(contrastive_loss_value.item())
 
-        # Log epoch losses
         epoch_loss = sum(epoch_loss_collector) / len(epoch_loss_collector)
         epoch_loss1 = sum(epoch_loss1_collector) / len(epoch_loss1_collector)
         epoch_loss2 = sum(epoch_loss2_collector) / len(epoch_loss2_collector)
         epoch_contr_loss = sum(epoch_contr_loss_collector) / len(epoch_contr_loss_collector)
 
-        logger.info('Epoch: %d Total Loss: %.6f CE Loss: %.6f FedCon Loss: %.6f Contrastive Loss: %.6f' % 
-                    (epoch, epoch_loss, epoch_loss1, epoch_loss2, epoch_contr_loss))
+        logger.info(f'Epoch: {epoch} Total Loss: {epoch_loss:.6f} CE Loss: {epoch_loss1:.6f} '
+                    f'FedCon Loss: {epoch_loss2:.6f} Contrastive Loss: {epoch_contr_loss:.6f}')
 
-    # Evaluate final accuracy
     train_acc, _ = compute_accuracy(net, train_dataloader, device=device)
     test_acc, conf_matrix, _ = compute_accuracy(net, test_dataloader, get_confusion_matrix=True, device=device)
 
-    logger.info('>> Final Training accuracy: %f' % train_acc)
-    logger.info('>> Final Test accuracy: %f' % test_acc)
-    net.to('cpu')
+    logger.info(f'>> Final Training accuracy: {train_acc:.6f}')
+    logger.info(f'>> Final Test accuracy: {test_acc:.6f}')
+    
+    net.to('cpu')  # Free GPU memory
     logger.info(' ** Training complete **')
 
     return train_acc, test_acc
+
 
 def local_train_net(nets, args, net_dataidx_map, train_dl=None, test_dl=None, global_model = None, prev_model_pool = None, server_c = None, clients_c = None, round=None, device="cpu"):
     avg_acc = 0.0
